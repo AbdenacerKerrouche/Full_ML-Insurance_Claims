@@ -1,0 +1,466 @@
+---
+title: "ML Exam S2"
+output: html_document
+date: "2026-05-24"
+---
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(embed)
+library(caret)
+library(patchwork)
+library(themis)
+library(pROC)
+library(ROCR)
+library(vip)
+library(knitr)
+library(kableExtra)
+library(bonsai)
+```
+#Q5. Perform exploratory data analysis focusing on the relationship between features and the target variable,What insights can you derive?
+
+we have performed Preprocessing, EDA and extracting insights from the relationship between features and the target variable on the unsupervised part, so we will just the preprocessed data and continue from there.
+
+```{r}
+full_data <- read.csv("C:/Users/E15/OneDrive/Documents/Programming/College/Exam ML S2/data/data_preprocessed.csv")
+data <- full_data %>% sample_frac(0.3)
+
+glimpse(data)
+summary(data)
+```
+
+
+
+
+```{r}
+categorical_cols <- c(
+  'claim_type', 'claim_detail_code', 'risk_category',
+  'geographic_region', 'document_completeness', 'payment_method', 'coverage_type',
+  'claim_channel', 'priority_level', 'fraud_indicator_flag', 'customer_segment',
+  'claim_complexity', 'adjuster_recommendation', 'automation_eligible',
+  'provider_network_status', 'claim_source', 'location_code','target'
+)
+
+data[categorical_cols] <- lapply(data[categorical_cols], as.factor)
+```
+
+
+```{r}
+table(data$target)
+prop.table(table(data$target))
+```
+there is a big class imbalanced in the target variable
+
+```{r}
+ggplot(data, aes(x = target, fill = target)) +
+  geom_bar() +
+  geom_text(stat='count', aes(label=..count..), vjust=-0.5) +
+  theme_minimal() +
+  labs(title="Target Distribution")
+```
+
+```{r}
+data %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~cor(.x, as.numeric(data$target), use = "complete.obs"))) %>%
+  pivot_longer(cols = everything()) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 30) %>%                
+  ggplot(aes(x = reorder(name, value), y = value)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 30 Feature Correlations with Target")
+```
+
+# Q6. Split the data (70% training, 30% testing) using stratified sampling.
+
+```{r q6_split}
+set.seed(2026)
+
+split <- initial_split(data, prop = 0.7, strata = target)
+train_data <- training(split)
+test_data  <- testing(split)
+
+cat("Training set:", nrow(train_data), "samples\n")
+cat("Test set:", nrow(test_data), "samples\n\n")
+
+cat("Training class distribution:\n")
+print(table(train_data$target))
+print(prop.table(table(train_data$target)))
+
+cat("\nTest class distribution:\n")
+print(table(test_data$target))
+print(prop.table(table(test_data$target)))
+```
+
+#Q7. Propose a preprocessing recipe/pipeline and justify the use of every step.
+
+```{r}
+rec <- recipe(target ~ ., data = train_data) %>%
+  step_zv(all_predictors()) %>%   # initial cleanup
+  step_nzv(all_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  
+  step_lencode_glm(claim_detail_code, outcome = "target") %>% # has 18k classes
+  step_dummy(all_nominal_predictors(), -claim_detail_code) %>% 
+  
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_lincomb(all_numeric_predictors()) %>%  
+  step_corr(all_numeric_predictors(), threshold = 0.90) %>%
+  
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(target, over_ratio = 0.5)
+```
+
+#Q8. Fit some models from your choosing.
+
+```{r}
+set.seed(2026)
+
+cv_folds <- vfold_cv(train_data, v = 5, strata = target)
+```
+
+```{r}
+log_base <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+rf_base <- rand_forest(trees = 300, mtry = 10, min_n = 5) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+xgb_base <- boost_tree(trees = 300, tree_depth = 6, learn_rate = 0.1) %>%
+  set_engine("xgboost", nthread = parallel::detectCores()) %>%
+  set_mode("classification")
+
+lgbm_base <- boost_tree(trees = 300, tree_depth = 6, learn_rate = 0.1) %>%
+  set_engine("lightgbm", nthread = parallel::detectCores()) %>%
+  set_mode("classification")
+```
+
+```{r}
+wf_log_base <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(log_base)
+
+wf_rf_base <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_base)
+
+wf_xgb_base <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_base)
+
+wf_lgbm_base <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lgbm_base)
+```
+
+```{r}
+metrics <- metric_set(
+  accuracy,
+  f_meas,
+  roc_auc,
+  pr_auc
+)
+```
+
+```{r}
+log_res <- fit_resamples(
+  wf_log_base,
+  resamples = cv_folds,
+  metrics = metrics
+)
+```
+```{r}
+rf_res <- fit_resamples(
+  wf_rf_base,
+  resamples = cv_folds,
+  metrics = metrics
+)
+```
+
+```{r}
+xgb_res <- fit_resamples(
+  wf_xgb_base,
+  resamples = cv_folds,
+  metrics = metrics
+)
+```
+
+```{r}
+lgbm_res <- fit_resamples(
+  wf_lgbm_base,
+  resamples = cv_folds,
+  metrics = metrics
+)
+```
+
+#Q9. Evaluate the results of the models on the testing set.
+
+```{r}
+rf_base_res <- last_fit(wf_rf_base, split, metrics = metrics)
+xgb_base_res <- last_fit(wf_xgb_base, split, metrics = metrics)
+lgbm_base_res <- last_fit(wf_lgbm_base, split, metrics = metrics)
+log_base_res <- last_fit(wf_log_base, split, metrics = metrics)
+```
+
+```{r}
+compare_models <- function(res, name){
+  collect_metrics(res) %>%
+    mutate(model = name)
+}
+
+test_base_results <- bind_rows(
+  compare_models(log_base_res, "Logistic"),
+  compare_models(rf_base_res, "RF"),
+  compare_models(xgb_base_res, "XGB"),
+  compare_models(lgbm_base_res, "LGBM")
+)
+```
+
+```{r}
+log_preds  <- collect_predictions(log_base_res)  %>% mutate(model = "Logistic")
+rf_preds   <- collect_predictions(rf_base_res)   %>% mutate(model = "Random Forest")
+xgb_preds  <- collect_predictions(xgb_base_res)  %>% mutate(model = "XGBoost")
+lgbm_preds <- collect_predictions(lgbm_base_res) %>% mutate(model = "LightGBM")
+
+all_preds <- bind_rows(log_preds, rf_preds, xgb_preds, lgbm_preds)
+```
+
+```{r}
+roc_curve_data <- all_preds %>%
+  group_by(model) %>%
+  roc_curve(target, .pred_1)
+
+autoplot(roc_curve_data) +
+  ggtitle("ROC Curves (Test Set)")
+```
+
+```{r}
+pr_curve_data <- all_preds %>%
+  group_by(model) %>%
+  pr_curve(target, .pred_1)
+
+autoplot(pr_curve_data) +
+  ggtitle("Precision-Recall Curves (Test Set)")
+```
+
+```{r}
+test_base_results
+```
+
+```{r}
+test_base_results %>%
+  ggplot(aes(model, .estimate, fill = model)) +
+  geom_col() +
+  facet_wrap(~.metric, scales="free_y") +
+  theme_minimal()
+```
+
+#Q10. Tune the hyperparameters of some models you are fitted. Compare the results before and after tuning.
+
+```{r}
+rf_spec <- rand_forest(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost", nthread = parallel::detectCores()) %>%
+  set_mode("classification")
+
+lgbm_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("lightgbm", nthread = parallel::detectCores()) %>%
+  set_mode("classification")
+```
+
+```{r}
+rf_grid <- grid_regular(
+  mtry(range = c(5, 10)),
+  min_n(range = c(5, 15)),
+  trees(range = c(200, 500)),
+  levels = 2
+)
+
+xgb_grid <- grid_space_filling(
+  tree_depth(range = c(3, 8)),
+  learn_rate(range = c(0.05, 0.3)),
+  loss_reduction(),
+  trees(range = c(200, 600)),
+  size = 20
+)
+
+lgbm_grid <- grid_space_filling(
+  tree_depth(range = c(3, 8)),
+  learn_rate(range = c(0.05, 0.3)),
+  loss_reduction(),
+  trees(range = c(200, 600)),
+  size = 20
+)
+```
+
+```{r}
+wf_rf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_spec)
+
+wf_xgb <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_spec)
+
+wf_lgbm <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lgbm_spec)
+```
+
+
+```{r}
+rf_tuned <- tune_grid(
+  wf_rf,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = metrics,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+```{r}
+xgb_tuned <- tune_grid(
+  wf_xgb,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = metrics,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+```{r}
+lgbm_tuned <- tune_grid(
+  wf_lgbm,
+  resamples = cv_folds,
+  grid = lgbm_grid,
+  metrics = metrics,
+  control = control_grid(verbose = TRUE)
+)
+```
+
+
+```{r}
+best_rf <- select_best(rf_tuned, metric = "pr_auc")
+best_xgb <- select_best(xgb_tuned, metric = "pr_auc")
+best_lgbm <- select_best(lgbm_tuned, metric = "pr_auc")
+
+final_rf  <- finalize_workflow(wf_rf, best_rf)
+final_xgb <- finalize_workflow(wf_xgb, best_xgb)
+final_lgbm <- finalize_workflow(wf_lgbm, best_lgbm)
+```
+
+```{r}
+rf_final_res <- last_fit(final_rf, split, metrics = metrics)
+xgb_final_res <- last_fit(final_xgb, split, metrics = metrics)
+lgbm_final_res <- last_fit(final_lgbm, split, metrics = metrics)
+```
+
+```{r}
+test_results <- bind_rows(
+  collect_metrics(rf_final_res)   %>% mutate(model = "Random Forest"),
+  collect_metrics(xgb_final_res)  %>% mutate(model = "XGBoost"),
+  collect_metrics(lgbm_final_res) %>% mutate(model = "LightGBM")
+)
+```
+
+```{r}
+test_results
+```
+
+```{r}
+test_results %>%
+  ggplot(aes(x = reorder(model, .estimate), y = .estimate, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ .metric, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Final Test Set Metrics (After Tuning)",
+    x = NULL,
+    y = "Metric Value"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Comparaison Before vs After Tuning
+
+```{r}
+test_base_results_compare <- test_base_results %>%
+  filter(.metric %in% c("roc_auc", "pr_auc")) %>%
+  mutate(stage = "Before tuning")
+```
+
+```{r}
+test_results_compare <- test_results %>%
+  filter(.metric %in% c("roc_auc", "pr_auc")) %>%
+  mutate(stage = "After tuning")
+```
+
+```{r}
+comparison <- bind_rows(test_base_results_compare, test_results_compare)
+
+comparison %>%
+  ggplot(aes(x = model, y = .estimate, fill = stage)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Before vs After Tuning")
+```
+
+#Q11. Analyze the final best model in detail: feature importance, confusion matrix, per-class metrics, and practical implications of the predictions.
+
+```{r}
+collect_predictions(xgb_base_res) %>%
+  conf_mat(target, .pred_class)
+```
+
+```{r}
+collect_predictions(xgb_base_res) %>%
+  roc_curve(target, .pred_1) %>%
+  autoplot()
+```
+
+```{r}
+collect_predictions(xgb_base_res) %>%
+  pr_curve(target, .pred_1) %>%
+  autoplot()
+```
+
+```{r}
+xgb_base_res %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10)
+```
+
+```{r}
+collect_predictions(xgb_base_res) %>%
+  group_by(target) %>%
+  summarise(
+    precision = precision_vec(target, .pred_class),
+    recall    = recall_vec(target, .pred_class),
+    f1        = f_meas_vec(target, .pred_class)
+  )
+```
